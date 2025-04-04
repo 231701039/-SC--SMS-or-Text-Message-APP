@@ -1,19 +1,98 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+import os
+from flask import Flask, request, jsonify
+from twilio.rest import Client
+from datetime import datetime
+import sqlite3
 
-trigger:
-- main
+app = Flask(__name__)
 
-pool:
-  vmImage: ubuntu-latest
+account_sid = os.environ.get("TWILIO_ACCOUNT_SID") or "YOUR_TWILIO_ACCOUNT_SID"
+auth_token = os.environ.get("TWILIO_AUTH_TOKEN") or "YOUR_TWILIO_AUTH_TOKEN"
+twilio_phone_number = os.environ.get("TWILIO_PHONE_NUMBER") or "+15551234567"
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+client = Client(account_sid, auth_token)
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+DATABASE = 'sms_app.db'
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row  
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    with app.open_resource('schema.sql', mode='r') as f:
+        conn.executescript(f.read())
+    conn.commit()
+    conn.close()
+
+
+try:
+    init_db()
+except sqlite3.OperationalError:
+    print("Database already exists, skipping initialization.")
+
+@app.route('/send_sms', methods=['POST'])
+def send_sms():
+    """User Story: As a user, I want to send a text message to a phone number."""
+    data = request.get_json()
+    to_number = data.get('to_number')
+    message_body = data.get('message_body')
+    user_id = data.get('user_id') 
+
+    if not to_number or not message_body or not user_id:
+        return jsonify({'error': 'Missing required parameters'}), 400
+
+    try:
+        message = client.messages.create(
+            body=message_body,
+            from_=twilio_phone_number,
+            to=to_number
+        )
+
+        conn = get_db_connection()
+        conn.execute('INSERT INTO messages (from_number, to_number, body, timestamp, status, user_id) VALUES (?, ?, ?, ?, ?, ?)',
+                     (twilio_phone_number, to_number, message_body, datetime.now().isoformat(), 'sent', user_id))
+        conn.commit()
+        conn.close()
+
+        return jsonify({'message': 'SMS sent successfully', 'message_sid': message.sid}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/receive_sms', methods=['POST'])
+def receive_sms():
+    """User Story: As a user, I want to receive text messages."""
+    from_number = request.form.get('From')
+    message_body = request.form.get('Body')
+
+    if not from_number or not message_body:
+        return 'Missing From or Body parameters', 400
+
+    conn = get_db_connection()
+    conn.execute('INSERT INTO messages (from_number, to_number, body, timestamp, status) VALUES (?, ?, ?, ?, ?)',
+                 (from_number, twilio_phone_number, message_body, datetime.now().isoformat(), 'received'))
+    conn.commit()
+    conn.close()
+
+    return '', 204
+
+@app.route('/messages/<user_id>', methods=['GET'])
+def get_messages(user_id):
+    """User Story: As a user, I want to see a list of my sent and received messages."""
+    conn = get_db_connection()
+    messages = conn.execute('SELECT * FROM messages WHERE user_id = ? OR to_number = ?', (user_id, twilio_phone_number)).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in messages]), 200
+
+@app.route('/messages/all', methods=['GET'])
+def get_all_messages():
+    """Admin User Story: As an admin, I want to see all messages."""
+    conn = get_db_connection()
+    messages = conn.execute('SELECT * FROM messages').fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in messages]), 200
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
